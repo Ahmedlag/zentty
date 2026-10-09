@@ -45,6 +45,14 @@ struct ClaudeHookSessionRecord: Codable, Equatable {
     /// entry: an allowlisted sibling announced right after the prompted call
     /// must not hand its id to the prompt. Reset when the turn ends.
     var preToolUseSlotsByAgentID: [String: [ClaudePreToolUseSlot]] = [:]
+    /// `true` from the `UserPromptSubmit` that opens a turn until the `Stop`
+    /// that closes it. The compaction hooks fire in both situations and only
+    /// one of them ends in a `Stop`: auto-compact and `/compact` happen inside
+    /// a turn, while Claude Code also compacts a long conversation with no
+    /// turn running at all, while the session sits idle at its prompt. That
+    /// idle compaction is never followed by a `Stop`, so a pane it promoted to
+    /// running stayed there until the next prompt.
+    var turnInFlight: Bool = false
     var lastNotificationText: String?
     var tasks: [ClaudeTaskRecord] = []
     var updatedAt: TimeInterval
@@ -150,6 +158,7 @@ extension ClaudeHookSessionRecord {
         case lastStructuredInteractionToolName
         case lastStructuredInteractionAgentID
         case preToolUseSlotsByAgentID
+        case turnInFlight
         case lastNotificationText
         case tasks
         case tasksByID
@@ -188,6 +197,7 @@ extension ClaudeHookSessionRecord {
             claudeHookSessionStoreLogger.warning("Dropping malformed preToolUseSlotsByAgentID for session \(sessionID, privacy: .public): \(description, privacy: .public)")
             preToolUseSlotsByAgentID = [:]
         }
+        turnInFlight = try container.decodeIfPresent(Bool.self, forKey: .turnInFlight) ?? false
         lastNotificationText = try container.decodeIfPresent(String.self, forKey: .lastNotificationText)
         if let decodedTasks = try container.decodeIfPresent([ClaudeTaskRecord].self, forKey: .tasks) {
             tasks = decodedTasks
@@ -220,6 +230,7 @@ extension ClaudeHookSessionRecord {
         try container.encodeIfPresent(lastStructuredInteractionToolName, forKey: .lastStructuredInteractionToolName)
         try container.encodeIfPresent(lastStructuredInteractionAgentID, forKey: .lastStructuredInteractionAgentID)
         try container.encode(preToolUseSlotsByAgentID, forKey: .preToolUseSlotsByAgentID)
+        try container.encode(turnInFlight, forKey: .turnInFlight)
         try container.encodeIfPresent(lastNotificationText, forKey: .lastNotificationText)
         try container.encode(tasks, forKey: .tasks)
         try container.encode(updatedAt, forKey: .updatedAt)
@@ -569,6 +580,35 @@ final class ClaudeHookSessionStore {
             record.updatedAt = Date().timeIntervalSince1970
             state.sessions[normalizedSessionID] = record
         }
+    }
+
+    /// Opens the turn on `UserPromptSubmit` and closes it on every hook that
+    /// hands the prompt back (`Stop`, the idle-prompt `Notification`, an
+    /// interrupted tool, a fresh `SessionStart`). Read by the compaction
+    /// hooks, which fire on both sides of that boundary.
+    func setTurnInFlight(_ inFlight: Bool, sessionID: String?) throws {
+        guard let normalizedSessionID = normalizedOptional(sessionID) else {
+            return
+        }
+
+        try withLockedState { state in
+            guard var record = state.sessions[normalizedSessionID], record.turnInFlight != inFlight else {
+                return
+            }
+            record.turnInFlight = inFlight
+            record.updatedAt = Date().timeIntervalSince1970
+            state.sessions[normalizedSessionID] = record
+        }
+    }
+
+    /// `false` for a session the store never saw: a compaction we cannot place
+    /// inside a turn must not move the pane, since only an in-turn compaction
+    /// is followed by a `Stop` to move it back.
+    func turnInFlight(sessionID: String?) throws -> Bool {
+        guard let normalizedSessionID = normalizedOptional(sessionID) else {
+            return false
+        }
+        return try lookup(sessionID: normalizedSessionID)?.turnInFlight ?? false
     }
 
     /// Forgets the open prompt. Also drops the remembered PreToolUse queues
