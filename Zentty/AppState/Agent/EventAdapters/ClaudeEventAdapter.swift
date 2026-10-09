@@ -42,8 +42,11 @@ struct ClaudeAdapterInput {
     /// `PostToolUseFailure` sets this when the user interrupted the tool
     /// (Escape / Ctrl-C). No Stop hook follows such an interrupt.
     let isInterrupt: Bool
-    /// `SessionStart` only: `startup`, `resume`, `clear` or `compact`.
+    /// `SessionStart` only: `startup`, `resume`, `clear`, `compact` or `fork`.
     let source: String?
+    /// `PreCompact` / `PostCompact` only: `manual` for `/compact`, `auto` for
+    /// both the context-full auto-compact and the idle one.
+    let trigger: String?
     let model: String?
 
     init(
@@ -64,6 +67,7 @@ struct ClaudeAdapterInput {
         agentTranscriptPath: String? = nil,
         isInterrupt: Bool = false,
         source: String? = nil,
+        trigger: String? = nil,
         model: String? = nil
     ) {
         self.hookEventName = hookEventName
@@ -83,6 +87,7 @@ struct ClaudeAdapterInput {
         self.agentTranscriptPath = agentTranscriptPath
         self.isInterrupt = isInterrupt
         self.source = source
+        self.trigger = trigger
         self.model = model
     }
 }
@@ -114,6 +119,7 @@ extension AgentEventBridge {
             agentTranscriptPath: JSONKeyAccess.firstString(in: json, keys: ["agent_transcript_path", "agentTranscriptPath"]),
             isInterrupt: claudeParseBool(in: json, keys: ["is_interrupt", "isInterrupt"]),
             source: JSONKeyAccess.firstString(in: json, keys: ["source"]),
+            trigger: JSONKeyAccess.firstString(in: json, keys: ["trigger"]),
             model: JSONKeyAccess.firstString(in: json, keys: hookEventName == "PostModelSwitch" ? ["to_model"] : ["model"])
         )
     }
@@ -203,13 +209,28 @@ extension AgentEventBridge {
                     // after it and needs its queued id.
                     resetsPreToolUseSlots: startsFresh
                 )
+                if startsFresh {
+                    try sessionStore.setTurnInFlight(false, sessionID: sessionID)
+                }
             }
             guard let pid else { return [] }
+            // A compaction restarts the session in place, and attaching the pid
+            // again pulls an idle pane back to `.starting` (PaneAgentReducer's
+            // `applyPID`). That is right mid-turn and wrong for a compaction
+            // that ran while the session sat idle, which no `Stop` follows.
+            // The pid is unchanged here either way; the original SessionStart
+            // already tracked it. `fork` is excluded: that is a new session id
+            // whose pid nothing has tracked yet.
+            if claudeSessionStartIsCompaction(source: input.source),
+               try !sessionStore.turnInFlight(sessionID: input.sessionID) {
+                return []
+            }
             return [pidPayload(target: target, toolName: toolName, pid: pid, event: .attach, sessionID: input.sessionID)]
 
         case "Notification":
             if input.notificationType == "idle_prompt" {
                 let target = try claudeResolvedTarget(for: input, environment: environment, sessionStore: sessionStore)
+                try sessionStore.setTurnInFlight(false, sessionID: input.sessionID)
                 let subagents = try subagentStore.summary(key: claudeSubagentKey(target))
                 return [claudeLifecyclePayload(target: target, state: .idle, confidence: .explicit, sessionID: input.sessionID, subagents: subagents)]
             }
@@ -365,6 +386,7 @@ extension AgentEventBridge {
                 // `.running` here would stick until the next prompt.
                 if let sessionID = input.sessionID {
                     try sessionStore.clearInteractionContext(sessionID: sessionID, keepsPreToolUseSlots: true)
+                    try sessionStore.setTurnInFlight(false, sessionID: sessionID)
                 }
                 guard existing?.structuredInteractionKind != nil else {
                     return []
@@ -414,6 +436,7 @@ extension AgentEventBridge {
             let target = try claudeResolvedTarget(for: input, environment: environment, sessionStore: sessionStore)
             if let sessionID = input.sessionID {
                 try sessionStore.clearInteractionContext(sessionID: sessionID)
+                try sessionStore.setTurnInFlight(true, sessionID: sessionID)
             }
             let promptExisting = try claudeLookupRecord(for: input, sessionStore: sessionStore)
             return [claudeLifecyclePayload(
@@ -445,6 +468,16 @@ extension AgentEventBridge {
             if let sessionID = input.sessionID {
                 try sessionStore.clearInteractionContext(sessionID: sessionID, keepsPreToolUseSlots: true)
             }
+            // Claude Code also compacts a long conversation while the session
+            // sits idle at its prompt, to keep the next turn inside the warm
+            // prompt cache. That compaction runs outside a turn and no `Stop`
+            // follows it, so saying `.running` here left the pane working
+            // until the user typed again. `/compact` from an idle prompt has
+            // the same shape, but the user asked for it and is watching, so it
+            // still shows the label and PostCompact puts the pane back.
+            guard try sessionStore.turnInFlight(sessionID: input.sessionID)
+                || claudeCompactionWasRequested(trigger: input.trigger)
+            else { return [] }
             let existing = try claudeLookupRecord(for: input, sessionStore: sessionStore)
             return [claudeLifecyclePayload(
                 target: target, state: .running, text: "Compacting", cwd: input.cwd ?? existing?.cwd,
@@ -455,6 +488,18 @@ extension AgentEventBridge {
         case "PostCompact":
             let target = try claudeResolvedTarget(for: input, environment: environment, sessionStore: sessionStore)
             let existing = try claudeLookupRecord(for: input, sessionStore: sessionStore)
+            // Outside a turn there is no Stop coming, so this hook is the only
+            // thing that can retire the label PreCompact may have shown. An
+            // automatic compaction said nothing, so it stays silent.
+            guard try sessionStore.turnInFlight(sessionID: input.sessionID) else {
+                guard claudeCompactionWasRequested(trigger: input.trigger) else { return [] }
+                let subagents = try subagentStore.summary(key: claudeSubagentKey(target))
+                return [claudeLifecyclePayload(
+                    target: target, state: .idle, cwd: input.cwd ?? existing?.cwd,
+                    interactionKind: .none, confidence: .explicit, sessionID: input.sessionID,
+                    subagents: subagents
+                )]
+            }
             return [claudeLifecyclePayload(
                 target: target, state: .running, cwd: input.cwd ?? existing?.cwd,
                 interactionKind: .none, confidence: .explicit, sessionID: input.sessionID,
@@ -481,6 +526,7 @@ extension AgentEventBridge {
             // back to needsInput.
             if let sessionID = input.sessionID {
                 try sessionStore.clearInteractionContext(sessionID: sessionID)
+                try sessionStore.setTurnInFlight(false, sessionID: sessionID)
             }
             // Agent tool calls run asynchronously: the parent ends its turn
             // while its subagents keep working and is re-woken when they
@@ -539,6 +585,19 @@ extension AgentEventBridge {
     }
 
     // MARK: - Claude Subagents
+
+    /// `/compact`, as opposed to the two automatic compactions (context full,
+    /// and the idle one that keeps a parked session inside its prompt cache).
+    static func claudeCompactionWasRequested(trigger: String?) -> Bool {
+        AgentInteractionClassifier.trimmed(trigger)?.lowercased() == "manual"
+    }
+
+    /// `SessionStart(compact)` is the compaction restarting the session in
+    /// place. `fork` also keeps the pane's subagents but is a new session with
+    /// its own pid, so it is not one of these.
+    static func claudeSessionStartIsCompaction(source: String?) -> Bool {
+        AgentInteractionClassifier.trimmed(source)?.lowercased() == "compact"
+    }
 
     /// `startup`, `resume` and `clear` all begin from an empty subagent set;
     /// `compact` continues the running session. An absent `source` (older

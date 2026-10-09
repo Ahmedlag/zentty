@@ -731,6 +731,159 @@ final class ClaudeApprovalResumeTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(sessionStore.lookup(sessionID: "s19")).preToolUseSlotsByAgentID.isEmpty, "SessionStart(startup) resets the queues")
     }
 
+    /// Claude Code 2.1.294 compacts a long conversation *while the session
+    /// sits idle at its prompt*, so the next turn still lands inside the warm
+    /// prompt cache instead of re-sending everything. The terminal prints
+    /// "Compacted while idle, before the prompt cache expired".
+    ///
+    /// It runs through the ordinary compaction path, so it fires the same
+    /// hooks a mid-turn auto-compact does (PreCompact, SessionStart(compact),
+    /// PostCompact, all with `trigger: "auto"`). What differs is what follows:
+    /// nothing. There is no turn, so no Stop ever arrives, and the pane that
+    /// PreCompact promoted to running stayed there for hours. The
+    /// SessionStart(compact) pid attach is the second half of it: it pulls an
+    /// idle session back to `.starting` (`applyPID`), which nothing clears
+    /// either.
+    func test_idle_compaction_leaves_the_pane_idle() throws {
+        var reducer = PaneAgentReducerState()
+        let base = Date(timeIntervalSince1970: 20_000)
+
+        try replay(#"{"hook_event_name":"SessionStart","session_id":"s20","source":"startup"}"#, into: &reducer, at: base)
+        try replay(#"{"hook_event_name":"UserPromptSubmit","session_id":"s20"}"#, into: &reducer, at: base + 1)
+        try replay(#"{"hook_event_name":"Stop","session_id":"s20"}"#, into: &reducer, at: base + 2)
+        XCTAssertEqual(reducer.reducedStatus(now: base + 3)?.state, .idle)
+
+        try replay(#"{"hook_event_name":"PreCompact","session_id":"s20","trigger":"auto"}"#, into: &reducer, at: base + 4)
+        XCTAssertEqual(
+            reducer.reducedStatus(now: base + 5)?.state,
+            .idle,
+            "a compaction with no turn behind it has no Stop coming, so it must not say running"
+        )
+
+        try replay(#"{"hook_event_name":"SessionStart","session_id":"s20","source":"compact"}"#, into: &reducer, at: base + 6)
+        XCTAssertEqual(
+            reducer.reducedStatus(now: base + 7)?.state,
+            .idle,
+            "the compaction restart re-attaches a pid that was never detached"
+        )
+
+        try replay(#"{"hook_event_name":"PostCompact","session_id":"s20","trigger":"auto","compact_summary":"…"}"#, into: &reducer, at: base + 8)
+        XCTAssertEqual(reducer.reducedStatus(now: base + 9)?.state, .idle)
+    }
+
+    func test_in_turn_compaction_still_reports_compacting() throws {
+        var reducer = PaneAgentReducerState()
+        let base = Date(timeIntervalSince1970: 20_500)
+
+        try replay(#"{"hook_event_name":"SessionStart","session_id":"s21","source":"startup"}"#, into: &reducer, at: base)
+        try replay(#"{"hook_event_name":"UserPromptSubmit","session_id":"s21"}"#, into: &reducer, at: base + 1)
+        try replay(#"{"hook_event_name":"PreToolUse","session_id":"s21","tool_name":"Bash","tool_use_id":"tu-21"}"#, into: &reducer, at: base + 2)
+
+        try replay(#"{"hook_event_name":"PreCompact","session_id":"s21","trigger":"auto"}"#, into: &reducer, at: base + 3)
+        let compacting = reducer.reducedStatus(now: base + 4)
+        XCTAssertEqual(compacting?.state, .running)
+        XCTAssertEqual(compacting?.text, "Compacting")
+
+        try replay(#"{"hook_event_name":"SessionStart","session_id":"s21","source":"compact"}"#, into: &reducer, at: base + 5)
+        try replay(#"{"hook_event_name":"PostCompact","session_id":"s21","trigger":"auto","compact_summary":"…"}"#, into: &reducer, at: base + 6)
+        let resumed = reducer.reducedStatus(now: base + 7)
+        XCTAssertEqual(resumed?.state, .running)
+        XCTAssertNil(resumed?.text, "PostCompact clears the Compacting label")
+
+        try replay(#"{"hook_event_name":"Stop","session_id":"s21"}"#, into: &reducer, at: base + 8)
+        XCTAssertEqual(reducer.reducedStatus(now: base + 9)?.state, .idle)
+    }
+
+    func test_compaction_restart_keeps_the_turn_open() throws {
+        // SessionStart(compact) keeps the session, so it must not close the
+        // turn the way a real restart does: the PostCompact that follows still
+        // has to report, and the Stop that ends the turn is still due.
+        _ = try makePayloads(#"{"hook_event_name":"SessionStart","session_id":"s22","source":"startup"}"#)
+        _ = try makePayloads(#"{"hook_event_name":"UserPromptSubmit","session_id":"s22"}"#)
+        _ = try makePayloads(#"{"hook_event_name":"SessionStart","session_id":"s22","source":"compact"}"#)
+        XCTAssertEqual(try sessionStore.lookup(sessionID: "s22")?.turnInFlight, true)
+
+        _ = try makePayloads(#"{"hook_event_name":"SessionStart","session_id":"s22","source":"startup"}"#)
+        XCTAssertEqual(
+            try sessionStore.lookup(sessionID: "s22")?.turnInFlight,
+            false,
+            "a real restart leaves no turn behind"
+        )
+    }
+
+    func test_turn_closing_hooks_without_a_stop_also_gate_compaction() throws {
+        // The idle-prompt Notification and an interrupted tool both hand the
+        // prompt back without a Stop reaching the bridge. A compaction after
+        // either of them is an idle one.
+        _ = try makePayloads(#"{"hook_event_name":"SessionStart","session_id":"s23","source":"startup"}"#)
+        _ = try makePayloads(#"{"hook_event_name":"UserPromptSubmit","session_id":"s23"}"#)
+        _ = try makePayloads(#"{"hook_event_name":"Notification","session_id":"s23","notification_type":"idle_prompt"}"#)
+        XCTAssertTrue(try makePayloads(#"{"hook_event_name":"PreCompact","session_id":"s23","trigger":"auto"}"#).isEmpty)
+
+        _ = try makePayloads(#"{"hook_event_name":"UserPromptSubmit","session_id":"s23"}"#)
+        _ = try makePayloads(#"{"hook_event_name":"PreToolUse","session_id":"s23","tool_name":"Bash","tool_use_id":"tu-23"}"#)
+        _ = try makePayloads(#"{"hook_event_name":"PostToolUseFailure","session_id":"s23","tool_name":"Bash","tool_use_id":"tu-23","is_interrupt":true}"#)
+        XCTAssertTrue(
+            try makePayloads(#"{"hook_event_name":"PostCompact","session_id":"s23","trigger":"auto"}"#).isEmpty,
+            "nothing reopens the turn an interrupt closed"
+        )
+    }
+
+    func test_manual_compact_from_an_idle_prompt_shows_and_then_clears() throws {
+        // `/compact` has the same shape as the idle compaction (no turn, no
+        // Stop), but the user asked for it and is watching it run. It keeps
+        // its label, and PostCompact is what puts the pane back.
+        var reducer = PaneAgentReducerState()
+        let base = Date(timeIntervalSince1970: 20_700)
+
+        try replay(#"{"hook_event_name":"SessionStart","session_id":"s26","source":"startup"}"#, into: &reducer, at: base)
+        try replay(#"{"hook_event_name":"UserPromptSubmit","session_id":"s26"}"#, into: &reducer, at: base + 1)
+        try replay(#"{"hook_event_name":"Stop","session_id":"s26"}"#, into: &reducer, at: base + 2)
+
+        try replay(#"{"hook_event_name":"PreCompact","session_id":"s26","trigger":"manual"}"#, into: &reducer, at: base + 3)
+        let compacting = reducer.reducedStatus(now: base + 4)
+        XCTAssertEqual(compacting?.state, .running)
+        XCTAssertEqual(compacting?.text, "Compacting")
+
+        try replay(#"{"hook_event_name":"SessionStart","session_id":"s26","source":"compact"}"#, into: &reducer, at: base + 5)
+        try replay(#"{"hook_event_name":"PostCompact","session_id":"s26","trigger":"manual","compact_summary":"…"}"#, into: &reducer, at: base + 6)
+        XCTAssertEqual(
+            reducer.reducedStatus(now: base + 7)?.state,
+            .idle,
+            "a requested compaction outside a turn has to retire its own label"
+        )
+    }
+
+    func test_session_start_fork_still_attaches_its_pid() throws {
+        // `fork` keeps the pane's subagents like `compact` does, but it is a
+        // new session id with a pid nothing has tracked yet, so suppressing
+        // its attach would leave the reducer without a process to sweep.
+        let payloads = try makePayloads(#"{"hook_event_name":"SessionStart","session_id":"s27","source":"fork"}"#)
+        XCTAssertEqual(payloads.map(\.pidEvent), [.attach])
+        XCTAssertEqual(payloads.first?.pid, 4242)
+    }
+
+    func test_compaction_in_an_unknown_session_reports_nothing() throws {
+        // Zentty started after the agent: the bridge cannot place this
+        // compaction inside a turn, and guessing running is the failure that
+        // sticks.
+        XCTAssertTrue(try makePayloads(#"{"hook_event_name":"PreCompact","session_id":"s24","trigger":"auto"}"#).isEmpty)
+        XCTAssertTrue(try makePayloads(#"{"hook_event_name":"PostCompact","session_id":"s24","trigger":"auto"}"#).isEmpty)
+    }
+
+    func test_record_written_before_the_turn_flag_decodes_closed() throws {
+        // Older state files have no turnInFlight key. Decoding must not throw
+        // (a throw drops every live session) and must default to closed.
+        let legacy = #"""
+        {"version":1,"sessions":{"s25":{"sessionID":"s25","worklaneIDRawValue":"w","paneIDRawValue":"p","preToolUseSlotsByAgentID":{},"tasks":[],"updatedAt":1}}}
+        """#
+        try Data(legacy.utf8).write(to: sessionStore.stateURL)
+
+        let record = try XCTUnwrap(sessionStore.lookup(sessionID: "s25"))
+        XCTAssertEqual(record.sessionID, "s25")
+        XCTAssertEqual(record.turnInFlight, false)
+    }
+
     func test_post_tool_use_without_id_leaves_the_queue_intact() throws {
         var reducer = PaneAgentReducerState()
         let base = Date(timeIntervalSince1970: 19_500)

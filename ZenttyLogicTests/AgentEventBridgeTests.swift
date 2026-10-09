@@ -2010,8 +2010,21 @@ final class AgentEventBridgeTests: XCTestCase {
     }
 
     func test_claude_adapter_pre_compact_sets_running_compacting_text() throws {
+        // Compaction only reports while a turn is open; see
+        // ClaudeIdleCompactionTests for the idle case.
+        let stores = try makeClaudeStores()
+        _ = try claudeAdapterPayloads(
+            data: Data(#"{"hook_event_name": "SessionStart", "session_id": "cs1", "source": "startup"}"#.utf8),
+            environment: claudeEnvironment(pid: "4242"),
+            stores: stores
+        )
+        _ = try claudeAdapterPayloads(
+            data: Data(#"{"hook_event_name": "UserPromptSubmit", "session_id": "cs1"}"#.utf8),
+            environment: claudeEnvironment(),
+            stores: stores
+        )
         let json = #"{"hook_event_name": "PreCompact", "session_id": "cs1", "cwd": "/tmp/project", "trigger": "manual"}"#
-        let payloads = try claudeAdapterPayloads(data: Data(json.utf8), environment: claudeEnvironment())
+        let payloads = try claudeAdapterPayloads(data: Data(json.utf8), environment: claudeEnvironment(), stores: stores)
 
         XCTAssertEqual(payloads.count, 1)
         XCTAssertEqual(payloads[0].state, .running)
@@ -2022,8 +2035,19 @@ final class AgentEventBridgeTests: XCTestCase {
     }
 
     func test_claude_adapter_post_compact_clears_compacting_text() throws {
+        let stores = try makeClaudeStores()
+        _ = try claudeAdapterPayloads(
+            data: Data(#"{"hook_event_name": "SessionStart", "session_id": "cs1", "source": "startup"}"#.utf8),
+            environment: claudeEnvironment(pid: "4242"),
+            stores: stores
+        )
+        _ = try claudeAdapterPayloads(
+            data: Data(#"{"hook_event_name": "UserPromptSubmit", "session_id": "cs1"}"#.utf8),
+            environment: claudeEnvironment(),
+            stores: stores
+        )
         let json = #"{"hook_event_name": "PostCompact", "session_id": "cs1", "cwd": "/tmp/project", "trigger": "auto"}"#
-        let payloads = try claudeAdapterPayloads(data: Data(json.utf8), environment: claudeEnvironment())
+        let payloads = try claudeAdapterPayloads(data: Data(json.utf8), environment: claudeEnvironment(), stores: stores)
 
         XCTAssertEqual(payloads.count, 1)
         XCTAssertEqual(payloads[0].state, .running)
@@ -2462,18 +2486,32 @@ final class AgentEventBridgeTests: XCTestCase {
     /// Runs the Claude adapter against temp-dir stores. The default
     /// `claudeAdapter` path writes to ~/Library/Application Support and left
     /// test session / subagent entries behind in the real state files.
-    private func claudeAdapterPayloads(data: Data, environment: [String: String]) throws -> [AgentStatusPayload] {
+    private func claudeAdapterPayloads(
+        data: Data,
+        environment: [String: String],
+        stores: (session: ClaudeHookSessionStore, subagent: AgentSubagentRegistryStore)? = nil
+    ) throws -> [AgentStatusPayload] {
+        let stores = try stores ?? makeClaudeStores()
+        return try AgentEventBridge.claudeAdapter(
+            data: data,
+            environment: environment,
+            sessionStore: stores.session,
+            subagentStore: stores.subagent
+        )
+    }
+
+    /// One temp-dir store pair, for the tests that need several hooks to land
+    /// in the same session record.
+    private func makeClaudeStores() throws -> (session: ClaudeHookSessionStore, subagent: AgentSubagentRegistryStore) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("zentty-claude-bridge-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
-        return try AgentEventBridge.claudeAdapter(
-            data: data,
-            environment: environment,
-            sessionStore: ClaudeHookSessionStore(
+        return (
+            ClaudeHookSessionStore(
                 stateURL: directory.appendingPathComponent("claude-hook-sessions.json", isDirectory: false)
             ),
-            subagentStore: AgentSubagentRegistryStore(
+            AgentSubagentRegistryStore(
                 stateURL: directory.appendingPathComponent("agent-subagent-sessions.json", isDirectory: false),
                 transcriptModificationDate: { _ in nil }
             )
