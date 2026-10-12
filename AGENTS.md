@@ -68,6 +68,13 @@ Re-run after:
 - any change to `AgentLaunchBootstrap.devinPlan` or `DevinEventAdapter`,
 - any change to `scripts/agent-bench/profiles/devin.json`.
 
+For the muse (Meta Muse Code) integration, the gate is `scripts/test-muse-bench`. It runs `smoke,session_capture,tools,tasks,approval,user_input,restore_launch,subagents` in `--strict` mode and covers the `TBH_MANAGED_HOOKS_PATH` overlay, the per-run `-c managed_hooks_env_vars` allowlist (Muse scrubs the hook env), and root-thread filtering. `smoke` and `session_capture` use Muse's free `echo` provider; the model scenarios pin the cheapest catalog model, `muse-spark-1.2` at `--reasoning-effort minimal`. Keep new muse scenarios on that model.
+
+Re-run after:
+- any muse CLI version bump,
+- any change to `AgentLaunchBootstrap.musePlan` or `MuseEventAdapter`,
+- any change to `scripts/agent-bench/profiles/muse.json`.
+
 For the kilo integration, the gate is `scripts/test-kilo-bench`. It runs `smoke,session_capture,approval,restore_launch,manual_compact` through the manifest-driven opencode-plugin path.
 
 Re-run after:
