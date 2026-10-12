@@ -254,6 +254,15 @@ enum AgentLaunchBootstrap {
                 runtimeDirectoryURL: runtimeDirectoryURL,
                 fileManager: fileManager
             )
+        case .muse:
+            return try musePlan(
+                executablePath: executablePath,
+                arguments: request.arguments,
+                environment: environment,
+                target: target,
+                runtimeDirectoryURL: runtimeDirectoryURL,
+                fileManager: fileManager
+            )
         }
     }
 
@@ -859,7 +868,7 @@ enum AgentLaunchBootstrap {
     /// a stale ephemeral overlay path. Matches the legacy cache root too, so a
     /// value captured by a long-lived agent before the relocation is still
     /// recognised rather than mistaken for a real user home.
-    private static func isZenttyRuntimeHomePath(_ path: String) -> Bool {
+    static func isZenttyRuntimeHomePath(_ path: String) -> Bool {
         ZenttyRuntimePaths.isRuntimeOverlayPath(path)
     }
 
@@ -1611,7 +1620,7 @@ enum AgentLaunchBootstrap {
         }
     }
 
-    private static func prepareToolDirectory(
+    static func prepareToolDirectory(
         toolID: String,
         target: AgentIPCTarget,
         runtimeDirectoryURL: URL,
@@ -2148,7 +2157,7 @@ enum AgentLaunchBootstrap {
         return (forwarded, source)
     }
 
-    private static func directPlan(
+    static func directPlan(
         executablePath: String,
         arguments: [String],
         unsetEnvironment: [String] = []
@@ -2176,6 +2185,8 @@ enum AgentLaunchBootstrap {
             return ["CLAUDECODE"]
         case .smallHarness:
             return smallHarnessManagedHookEnvironmentKeys
+        case .muse:
+            return museInheritedOverlayKeys(environment: environment)
         case .kimi:
             // A disabled/restore-suppressed launch must still shed a stale
             // overlay home from a pre-fix pane or restore snapshot, or kimi
@@ -2365,7 +2376,7 @@ enum AgentLaunchBootstrap {
         ]
     }
 
-    private static func shellEscapedDoubleQuoted(_ string: String) -> String {
+    static func shellEscapedDoubleQuoted(_ string: String) -> String {
         string
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
@@ -2381,7 +2392,7 @@ enum AgentLaunchBootstrap {
         return string
     }
 
-    private static func compactJSONData(_ object: Any) throws -> Data {
+    static func compactJSONData(_ object: Any) throws -> Data {
         try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
     }
 
