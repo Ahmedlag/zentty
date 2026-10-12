@@ -28,7 +28,7 @@ from collections import Counter
 from typing import Any
 
 
-SUPPORTED_AGENTS = ("agy", "amp", "claude", "codex", "copilot", "cursor", "devin", "droid", "gemini", "generic-canonical", "grok", "hermes", "kilo", "kimi", "kimi-code", "omp", "opencode", "opencode-v2", "pi", "small-harness", "vibe")
+SUPPORTED_AGENTS = ("agy", "amp", "claude", "codex", "copilot", "cursor", "devin", "droid", "gemini", "generic-canonical", "grok", "hermes", "kilo", "kimi", "kimi-code", "muse", "omp", "opencode", "opencode-v2", "pi", "small-harness", "vibe")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BENCH_ROOT = pathlib.Path(__file__).resolve().parent
 DEFAULT_RUNS_DIR = REPO_ROOT / ".agent-bench-runs"
@@ -55,6 +55,9 @@ ROUTING_ENV_KEYS = {
     "ZENTTY_GROK_PID",
     "ZENTTY_AGY_PID",
     "ZENTTY_DEVIN_PID",
+    "ZENTTY_MUSE_PID",
+    "MUSE_SESSION_ID",
+    "TBH_MANAGED_HOOKS_PATH",
     "ZENTTY_SMALL_HARNESS_PID",
     "CODEX_HOME",
     "COPILOT_HOME",
@@ -84,6 +87,17 @@ SMALL_HARNESS_HOOK_ENV_VARS = [
     "ZENTTY_PANE_TOKEN",
     "ZENTTY_INSTANCE_ID",
     "ZENTTY_SMALL_HARNESS_PID",
+]
+# Mirror of AgentLaunchBootstrap.museHookEnvironmentKeys: Muse scrubs the
+# hook environment down to PATH, HOME, MUSE_* and this per-run allowlist.
+MUSE_HOOK_ENV_VARS = [
+    "ZENTTY_INSTANCE_SOCKET",
+    "ZENTTY_INSTANCE_ID",
+    "ZENTTY_WINDOW_ID",
+    "ZENTTY_WORKLANE_ID",
+    "ZENTTY_PANE_ID",
+    "ZENTTY_PANE_TOKEN",
+    "ZENTTY_MUSE_PID",
 ]
 SECRET_ENV_PATTERNS = re.compile(r"(TOKEN|SECRET|PASSWORD|API_KEY|AUTH|KEY|CREDENTIAL|COOKIE)", re.I)
 SENSITIVE_PAYLOAD_KEY_PATTERNS = re.compile(
@@ -417,6 +431,13 @@ def hook_record_event_names(record: TraceRecord) -> list[str | None]:
     tool_name = first_string(payload, ["tool_name", "toolName"])
     if tool_name:
         names.append(f"{record.event_name}:{tool_name}")
+    # Batch events (Muse PostToolBatch) carry their calls in `tool_calls`.
+    batch_calls = payload.get("tool_calls")
+    if isinstance(batch_calls, list):
+        for call in batch_calls:
+            call_tool = first_string(call, ["tool_name", "toolName"]) if isinstance(call, dict) else None
+            if call_tool and f"{record.event_name}:{call_tool}" not in names:
+                names.append(f"{record.event_name}:{call_tool}")
     return names
 
 
@@ -556,6 +577,9 @@ def session_id_matches_pattern(session_id: str, pattern: str) -> bool:
         return re.fullmatch(r"T-[A-Za-z0-9_-]+", session_id) is not None
     if pattern == "opencode":
         return re.fullmatch(r"ses_[A-Za-z0-9]+", session_id) is not None
+    if pattern == "muse":
+        # Muse Code session ids are UUIDv7s (`01a1312b-07c1-7eb0-…`).
+        return session_id_matches_pattern(session_id, "uuid")
     if pattern == "devin":
         # Devin session ids are human-readable word slugs (`thorn-angora`).
         return re.fullmatch(r"[a-z0-9][a-z0-9-]*", session_id) is not None
@@ -1282,6 +1306,17 @@ def task_observations_for_records(agent: str, scenario: str, records: list[Trace
             )
             continue
 
+        # Muse reports its todo tool only through PostToolBatch, whose
+        # `tool_calls` array carries each call's tool_name / tool_input.
+        batch_calls = payload.get("tool_calls")
+        if isinstance(batch_calls, list):
+            batch_task_calls = [
+                call for call in batch_calls
+                if isinstance(call, dict) and is_task_tool_name(first_string(call, ["tool_name", "toolName"]) or "")
+            ]
+            if batch_task_calls:
+                payload = {**payload, **batch_task_calls[-1]}
+
         # Case 1: Raw PreToolUse / tool call with a task tool (TodoWrite,
         # update_plan, write_todos, TaskCreate/TaskUpdate, ...). Supports
         # top-level and nested payloads (tool_use.name / tool_use.input ...).
@@ -1420,6 +1455,19 @@ def subagent_trace_extra(agent: str | None, event_name: str | None, stdin_payloa
         payload_event = str(first_string(payload, ["hook_event_name", "hookEventName"]) or "").lower()
         if payload_event in SUBAGENT_START_EVENTS | SUBAGENT_STOP_EVENTS:
             lowered = payload_event
+        elif agent == "muse" and payload_event == "pretooluse" and payload.get("tool_name") == "subagent_spawn":
+            # Muse's SubagentStart carries no agent type; the adapter takes it
+            # from the spawn call's `role`, so record that as a spawn fact.
+            tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+            return {
+                "subagent": {
+                    "event": "spawn",
+                    "agent_type": first_string(tool_input, ["role", "subagent_type", "agent_type"]),
+                    "agent_id": first_string(payload, ["tool_use_id", "toolUseId"]),
+                    "model": None,
+                    "nickname": None,
+                }
+            }
         elif agent == "devin" and payload_event in ("pretooluse", "posttooluse") and payload.get("tool_name") in ("run_subagent", "sidekick"):
             # Devin has no Subagent* lifecycle events; the run_subagent /
             # sidekick tool call IS the contract. PreToolUse starts the
@@ -1430,10 +1478,17 @@ def subagent_trace_extra(agent: str | None, event_name: str | None, stdin_payloa
             lowered = "subagentstart" if payload_event == "pretooluse" else "subagentstop"
         else:
             return None
+    if agent == "muse":
+        # Muse's internal reminder agents (`skill-reminder`, `goal-reminder`, …)
+        # share the Subagent* events with real delegations; the adapter drops
+        # them, so they must not satisfy a subagent expectation either.
+        muse_subagent_id = first_string(payload, ["subagent_id", "subagentId"]) or ""
+        if not muse_subagent_id or muse_subagent_id.endswith("-reminder"):
+            return None
     transcript_path = first_string(payload, ["agent_transcript_path", "agentTranscriptPath"])
     resolved = resolve_subagent_model(agent, transcript_path, payload)
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
-    agent_id = first_string(payload, ["agent_id", "agentId", "turn_id", "turnId"])
+    agent_id = first_string(payload, ["agent_id", "agentId", "subagent_id", "subagentId", "turn_id", "turnId"])
     run_agent_id: str | None = None
     if agent == "devin":
         # tool_use_id (`run_subagent_N`) is the stable key across the
@@ -2498,6 +2553,68 @@ class LaunchPlanner:
                 "ZENTTY_DEVIN_CONFIG_OVERLAY": str(overlay),
                 "ZENTTY_DEVIN_CONFIG_SOURCE": str(source),
             },
+        )
+
+    def _plan_muse(self, executable: str, arguments: list[str], environment: dict[str, Any], cli_path: str) -> dict[str, Any]:
+        """Mirror of AgentLaunchBootstrap.musePlan: TBH_MANAGED_HOOKS_PATH
+        replaces settings.json's managed_hooks_path, so the overlay is the
+        user's managed hooks file plus the Zentty hooks, and a per-run
+        `-c managed_hooks_env_vars=[...]` lets the routing env through Muse's
+        hook env scrub (inserted after `exec`, prepended otherwise)."""
+        command = f'"{shell_escape_double_quoted(cli_path)}" ipc agent-event --adapter=muse'
+        hook_specs = (
+            ("SessionStart", 10, False), ("SessionEnd", 5, False), ("UserPromptSubmit", 10, False),
+            ("PreToolUse", 5, False), ("ToolUseStart", 5, True), ("PostToolUse", 5, False),
+            ("PostToolUseFailure", 5, False), ("PostToolBatch", 5, False), ("PermissionRequest", 10, False),
+            ("Notification", 10, False), ("SubagentStart", 5, False), ("SubagentStop", 5, False),
+            ("PreCompact", 10, False), ("PostCompact", 10, False), ("Stop", 10, False),
+            ("StopFailure", 10, False), ("Interrupt", 5, True),
+        )
+        config_home = pathlib.Path(
+            str(environment.get("XDG_CONFIG_HOME") or pathlib.Path(str(environment.get("HOME") or pathlib.Path.home())) / ".config")
+        )
+        settings = read_jsonc_object(config_home / "muse" / "settings.json")
+        source_path = str(environment.get("TBH_MANAGED_HOOKS_PATH") or "")
+        if source_path and _is_zentty_runtime_path(source_path):
+            # A nested launch inherits the parent's overlay; fall back to settings.
+            source_path = ""
+        if not source_path and isinstance(settings.get("managed_hooks_path"), str):
+            source_path = settings["managed_hooks_path"]
+            home = str(environment.get("HOME") or pathlib.Path.home())
+            for prefix in ("~/", "$HOME/", "${HOME}/"):
+                if source_path.startswith(prefix):
+                    source_path = str(pathlib.Path(home) / source_path[len(prefix):])
+                    break
+        hooks_file = read_jsonc_object(pathlib.Path(source_path)) if source_path else {}
+        hooks = hooks_file.get("hooks") if isinstance(hooks_file.get("hooks"), dict) else {}
+        for event, timeout, is_async in hook_specs:
+            groups = hooks.get(event) if isinstance(hooks.get(event), list) else []
+            if not any(
+                isinstance(group, dict)
+                and any(isinstance(hook, dict) and hook.get("command") == command for hook in group.get("hooks") or [])
+                for group in groups
+            ):
+                handler: dict[str, Any] = {"type": "command", "command": command, "timeout": timeout}
+                if is_async:
+                    handler["async"] = True
+                groups.append({"matcher": "", "hooks": [handler]})
+            hooks[event] = groups
+        hooks_file["hooks"] = hooks
+        overlay = self._overlay_dir("muse") / "managed-hooks.json"
+        write_json(overlay, hooks_file)
+
+        forwarded, user_names = _extract_muse_hook_env_allowlist(arguments)
+        configured = settings.get("managed_hooks_env_vars") if isinstance(settings.get("managed_hooks_env_vars"), list) else []
+        allowlist = list(dict.fromkeys([*configured, *user_names, *MUSE_HOOK_ENV_VARS]))
+        inserted = ["-c", "managed_hooks_env_vars=" + json.dumps(allowlist, separators=(",", ":"))]
+        if forwarded[:1] == ["exec"]:
+            launch_arguments = ["exec", *inserted, *forwarded[1:]]
+        else:
+            launch_arguments = [*inserted, *forwarded]
+        return self._launch_plan(
+            executable,
+            launch_arguments,
+            {"ZENTTY_AGENT_TOOL": "muse", "TBH_MANAGED_HOOKS_PATH": str(overlay)},
         )
 
     def _plan_droid(self, executable: str, arguments: list[str], environment: dict[str, Any], cli_path: str) -> dict[str, Any]:
@@ -4289,6 +4406,10 @@ def run_pty(
     os.close(slave)
     start = time.monotonic()
     sent = [False] * len(inputs)
+    # When each input's `match` first appeared; an optional `delay` (seconds)
+    # counts from there, for TUIs that ignore keys typed the instant a prompt
+    # opens.
+    matched_at: list[float | None] = [None] * len(inputs)
     output = bytearray()
     terminal_observations: list[TerminalObservation] = []
     seen_terminal_offsets: set[tuple[int, str]] = set()
@@ -4320,6 +4441,10 @@ def run_pty(
                     text_so_far = output.decode("utf-8", errors="replace")
                     if not re.search(match, text_so_far, flags=re.I | re.S):
                         continue
+                if matched_at[index] is None:
+                    matched_at[index] = now
+                if now - (matched_at[index] or now) < float(item.get("delay", 0)):
+                    continue
                 if now - start >= float(item.get("after", 0)):
                     text_so_far = output.decode("utf-8", errors="replace")
                     os.write(master, str(item.get("text", "")).encode("utf-8"))
@@ -5040,6 +5165,48 @@ def read_jsonc_object(path: pathlib.Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _is_zentty_runtime_path(path: str) -> bool:
+    """Mirror of ZenttyRuntimePaths.isRuntimeOverlayPath."""
+    standardized = os.path.normpath(path)
+    return "/.config/zentty/run/" in standardized or "/Library/Caches/Zentty/" in standardized
+
+
+def _extract_muse_hook_env_allowlist(arguments: list[str]) -> tuple[list[str], list[str]]:
+    """Mirror of AgentLaunchBootstrap.extractMuseHookEnvAllowlist: a user
+    `-c managed_hooks_env_vars=[...]` is folded into ours, since Muse refuses
+    a run that sets one key twice."""
+    prefix = "managed_hooks_env_vars="
+
+    def parsed(assignment: str) -> list[str] | None:
+        if not assignment.startswith(prefix):
+            return None
+        try:
+            values = json.loads(assignment[len(prefix):])
+        except ValueError:
+            return None
+        return [str(value) for value in values] if isinstance(values, list) else None
+
+    forwarded: list[str] = []
+    names: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            forwarded.extend(arguments[index:])
+            break
+        if argument in ("-c", "--config") and index + 1 < len(arguments) and (values := parsed(arguments[index + 1])) is not None:
+            names.extend(values)
+            index += 2
+            continue
+        if argument.startswith("--config=") and (values := parsed(argument[len("--config="):])) is not None:
+            names.extend(values)
+            index += 1
+            continue
+        forwarded.append(argument)
+        index += 1
+    return forwarded, names
 
 
 def _extract_devin_config_override(arguments: list[str]) -> tuple[list[str], str | None]:
