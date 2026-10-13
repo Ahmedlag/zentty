@@ -3286,6 +3286,7 @@ class ProfileTests(unittest.TestCase):
                 "kilo",
                 "kimi",
                 "kimi-code",
+                "muse",
                 "omp",
                 "opencode",
                 "opencode-v2",
@@ -4462,6 +4463,130 @@ class LaunchPlannerTests(unittest.TestCase):
                     self.assertIn("SessionStart", config["hooks"])
                     self.assertEqual(plan["arguments"][2:], ["-p", "hello"])
                     self.assertEqual(source.read_text(), original)
+
+    def test_muse_plan_writes_managed_hooks_and_env_allowlist(self):
+        for arguments, expected in (
+            (["--model", "m", "hi"], ["-c", None, "--model", "m", "hi"]),
+            (["exec", "--provider", "echo", "hi"], ["exec", "-c", None, "--provider", "echo", "hi"]),
+            (["resume", "abc"], ["-c", None, "resume", "abc"]),
+        ):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                profile = agent_bench.load_profiles(ROOT / "profiles")["muse"]
+                planner = agent_bench.LaunchPlanner(profile=profile, scenario="smoke", run_dir=root / "run", resources_dir=None)
+
+                plan = planner._plan_muse("/usr/bin/muse", arguments, {"HOME": str(root)}, "/usr/bin/zentty")
+
+                allowlist_index = plan["arguments"].index("-c") + 1
+                self.assertEqual(
+                    [None if index == allowlist_index else value for index, value in enumerate(plan["arguments"])],
+                    expected,
+                )
+                allowlist = json.loads(plan["arguments"][allowlist_index].split("=", 1)[1])
+                self.assertEqual(allowlist, agent_bench.MUSE_HOOK_ENV_VARS)
+                hooks = json.loads(pathlib.Path(plan["setEnvironment"]["TBH_MANAGED_HOOKS_PATH"]).read_text())["hooks"]
+                self.assertEqual(hooks["Stop"][0]["hooks"][0]["command"], '"/usr/bin/zentty" ipc agent-event --adapter=muse')
+                self.assertTrue(hooks["ToolUseStart"][0]["hooks"][0]["async"])
+                self.assertTrue(hooks["Interrupt"][0]["hooks"][0]["async"])
+                self.assertNotIn("async", hooks["Stop"][0]["hooks"][0])
+
+    def test_muse_plan_merges_user_managed_hooks_and_allowlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            managed = root / "enterprise-hooks.json"
+            managed.write_text('{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"audit"}]}]}}', encoding="utf-8")
+            (root / ".config" / "muse").mkdir(parents=True)
+            (root / ".config" / "muse" / "settings.json").write_text(
+                json.dumps({"managed_hooks_path": str(managed), "managed_hooks_env_vars": ["AUDIT"]}), encoding="utf-8"
+            )
+            profile = agent_bench.load_profiles(ROOT / "profiles")["muse"]
+            planner = agent_bench.LaunchPlanner(profile=profile, scenario="smoke", run_dir=root / "run", resources_dir=None)
+
+            plan = planner._plan_muse(
+                "/usr/bin/muse", ["-c", 'managed_hooks_env_vars=["MINE"]', "hi"], {"HOME": str(root)}, "/usr/bin/zentty"
+            )
+
+            self.assertEqual(plan["arguments"].count("-c"), 1)
+            allowlist = json.loads(plan["arguments"][1].split("=", 1)[1])
+            self.assertEqual(allowlist, ["AUDIT", "MINE", *agent_bench.MUSE_HOOK_ENV_VARS])
+            hooks = json.loads(pathlib.Path(plan["setEnvironment"]["TBH_MANAGED_HOOKS_PATH"]).read_text())["hooks"]
+            self.assertEqual([group["hooks"][0]["command"] for group in hooks["Stop"]][0], "audit")
+            self.assertEqual(len(hooks["Stop"]), 2)
+
+    def test_muse_plan_nested_launch_falls_back_to_tilde_settings_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "hooks.json").write_text('{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"audit"}]}]}}', encoding="utf-8")
+            (root / ".config" / "muse").mkdir(parents=True)
+            (root / ".config" / "muse" / "settings.json").write_text('{"managed_hooks_path":"~/hooks.json"}', encoding="utf-8")
+            profile = agent_bench.load_profiles(ROOT / "profiles")["muse"]
+            planner = agent_bench.LaunchPlanner(profile=profile, scenario="smoke", run_dir=root / "run", resources_dir=None)
+
+            plan = planner._plan_muse(
+                "/usr/bin/muse", [],
+                {"HOME": str(root), "TBH_MANAGED_HOOKS_PATH": "/Users/x/.config/zentty/run/launch/w/p/muse/managed-hooks.json"},
+                "/usr/bin/zentty",
+            )
+
+            hooks = json.loads(pathlib.Path(plan["setEnvironment"]["TBH_MANAGED_HOOKS_PATH"]).read_text())["hooks"]
+            self.assertEqual(hooks["Stop"][0]["hooks"][0]["command"], "audit")
+
+    def test_subagent_trace_extra_muse_skips_reminder_agents(self):
+        reminder = json.dumps({"hook_event_name": "SubagentStart", "subagent_id": "skill-reminder", "session_id": "c"})
+        self.assertIsNone(agent_bench.subagent_trace_extra("muse", "SubagentStart", reminder))
+
+        real = json.dumps(
+            {"hook_event_name": "SubagentStart", "subagent_id": "01a1312f-40aa", "session_id": "c", "model": "muse-spark-1.2"}
+        )
+        spawn = json.dumps(
+            {"hook_event_name": "PreToolUse", "tool_name": "subagent_spawn", "tool_use_id": "call_s", "tool_input": {"role": "assistant"}}
+        )
+        self.assertEqual(agent_bench.subagent_trace_extra("muse", "PreToolUse", spawn)["subagent"]["agent_type"], "assistant")
+
+        extra = agent_bench.subagent_trace_extra("muse", "SubagentStart", real)
+        self.assertEqual(extra["subagent"]["event"], "start")
+        self.assertEqual(extra["subagent"]["agent_id"], "01a1312f-40aa")
+        self.assertEqual(extra["subagent"]["model"], "muse-spark-1.2")
+
+    def test_muse_post_tool_batch_reports_todos_and_qualified_event(self):
+        record = agent_bench.TraceRecord(
+            kind="hook",
+            agent="muse",
+            scenario="tasks",
+            event_name="PostToolBatch",
+            adapter="muse",
+            standard_input=json.dumps(
+                {
+                    "hook_event_name": "PostToolBatch",
+                    "session_id": "s-1",
+                    "tool_calls": [
+                        {
+                            "tool_name": "write_todos",
+                            "tool_input": {
+                                "todos": [
+                                    {"text": "Review directory", "status": "completed"},
+                                    {"text": "Identify main language", "status": "in_progress"},
+                                    {"text": "Suggest one improvement", "status": "pending"},
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ),
+        )
+
+        self.assertIn("PostToolBatch:write_todos", agent_bench.hook_record_event_names(record))
+        observations = agent_bench.task_observations_for_records("muse", "tasks", [record])
+        self.assertEqual(observations[-1]["done"], 1)
+        self.assertEqual(observations[-1]["total"], 3)
+        self.assertEqual(
+            [item["title"] for item in observations[-1]["items"]],
+            ["Review directory", "Identify main language", "Suggest one improvement"],
+        )
+
+    def test_muse_session_id_pattern_accepts_uuid_v7(self):
+        self.assertTrue(agent_bench.session_id_matches_pattern("01a1312b-07c1-7eb0-8d56-c65f7b11496b", "muse"))
+        self.assertFalse(agent_bench.session_id_matches_pattern("skill-reminder", "muse"))
 
     def test_devin_config_extraction_preserves_arguments_after_separator(self):
         for prompt in (["--config=example.json"], ["--config", "example.json"]):
