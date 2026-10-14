@@ -154,11 +154,14 @@ final class ClaudeDaemonPaneRoutingTests: XCTestCase {
         XCTAssertEqual(attached[2].sessionID, Self.sessionID)
 
         XCTAssertEqual(try send("Stop", from: Self.paneA).map(\.paneID), [PaneID("pane-b")])
+        // A compaction while the session sits idle moves nothing, so it cannot
+        // bounce the session back to pane A either.
+        XCTAssertTrue(try send("SessionStart", source: "compact", from: Self.paneA).isEmpty)
         // A resume, clear or compaction while attached must not bounce it back.
+        XCTAssertEqual(try send("UserPromptSubmit", from: Self.paneA).map(\.paneID), [PaneID("pane-b")])
         let restarted = try send("SessionStart", source: "compact", from: Self.paneA)
         XCTAssertEqual(restarted.map(\.paneID), [PaneID("pane-b")])
         XCTAssertEqual(restarted.first?.pid, 4242)
-        XCTAssertEqual(try send("UserPromptSubmit", from: Self.paneA).map(\.paneID), [PaneID("pane-b")])
 
         // Detach: the client exits without any hook.
         clientIsAlive = false
